@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Adaptive LSB Steganography — Phase 2 Upgrade</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"></script>
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Inter', 'sans-serif'] },
+                    colors: {
+                        'background': '#0F172A',
+                        'card': '#1E293B',
+                        'secondary-card': '#334155',
+                        'primary': '#6366F1',
+                        'primary-dark': '#4F46E5',
+                        'text-light': '#F8FAFC',
+                        'text-muted': '#94A3B8',
+                        'border-color': '#334155',
+                        'error-color': '#F87171',
+                        'success-color': '#34D399',
+                    },
+                },
+            },
+        };
+    </script>
+    <style>
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-thumb { background-color: #475569; border-radius: 4px; }
+        ::-webkit-scrollbar-track { background-color: #1E293B; }
+        .legend-dot { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 5px; vertical-align: middle; }
+    </style>
+</head>
+<body class="bg-background text-text-light min-h-screen p-4 sm:p-8">
+
+<div id="root"></div>
+
+<!--
+  ══════════════════════════════════════════════════════════════════
+  WEB WORKER SOURCE (stringified, spawned as Blob URL at runtime)
+  All heavy CPU work runs here so the UI thread never freezes.
+  ══════════════════════════════════════════════════════════════════
+-->
+<script id="worker-src" type="text/plain">
+// ─────────────────────────────────────────────────────────────────
+// WORKER — self-contained; no DOM access, no React, no CryptoJS
+// Uses SubtleCrypto (available in workers) for SHA-256 seeding
+// ─────────────────────────────────────────────────────────────────
+
+const T1 = 30;
+const T2 = 80;
+const DELIMITER = '$$END$$';
+
+// ── SHA-256 via SubtleCrypto (async, available in workers) ────────
+async function sha256Hex(str) {
+    const enc = new TextEncoder();
+    const buf = await crypto.subtle.digest('SHA-256', enc.encode(str));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+
+// ── Texture analysis ──────────────────────────────────────────────
+function computeAdaptiveMap(pixels, width, height) {
+    const W = width, H = height;
+    const grey = new Float32Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+        const p = i * 4;
+        grey[i] = 0.299 * pixels[p] + 0.587 * pixels[p+1] + 0.114 * pixels[p+2];
+    }
+    const Kx = [-1,0,1,-2,0,2,-1,0,1];
+    const Ky = [-1,-2,-1,0,0,0,1,2,1];
+    const adaptiveMap = new Uint8Array(W * H);
+    for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+            const idx = y * W + x;
+            let gx = 0, gy = 0;
+            for (let ky = -1; ky <= 1; ky++) {
+                for (let kx = -1; kx <= 1; kx++) {
+                    const ny = Math.min(Math.max(y+ky,0),H-1);
+                    const nx = Math.min(Math.max(x+kx,0),W-1);
+                    const val = grey[ny*W+nx];
+                    const ki = (ky+1)*3+(kx+1);
+                    gx += Kx[ki]*val; gy += Ky[ki]*val;
+                }
+            }
+            const sobelMag = Math.sqrt(gx*gx+gy*gy)/4;
+            let sum=0,sum2=0,count=0;
+            for (let vy=-2;vy<=2;vy++) {
+                for (let vx=-2;vx<=2;vx++) {
+                    const ny=Math.min(Math.max(y+vy,0),H-1);
+                    const nx=Math.min(Math.max(x+vx,0),W-1);
+                    const v=grey[ny*W+nx];
+                    sum+=v; sum2+=v*v; count++;
+                }
+            }
+            const mean=sum/count;
+            const variance=Math.sqrt(Math.max(0,sum2/count-mean*mean));
+            const V=Math.min(255,Math.max(sobelMag,variance));
+            adaptiveMap[idx]=V<T1?1:V<T2?2:3;
+        }
+    }
+    return adaptiveMap;
+}
+
+// ── LCG pixel order ───────────────────────────────────────────────
+function generatePixelOrder(numPixels, hashHex) {
+    let seed = parseInt(hashHex.substring(0,8),16);
+    const lcg = () => {
+        seed = (seed*1664525+1013904223)&0xFFFFFFFF;
+        return (seed>>>0)/0xFFFFFFFF;
+    };
+    const order = new Uint32Array(numPixels);
+    for (let i=0;i<numPixels;i++) order[i]=i;
+    for (let i=numPixels-1;i>0;i--) {
+        const j=Math.floor(lcg()*(i+1));
+        const tmp=order[i]; order[i]=order[j]; order[j]=tmp;
+    }
+    return order;
+}
+
+// ── Adaptive capacity ─────────────────────────────────────────────
+function computeAdaptiveCapacity(adaptiveMap) {
+    let total=0;
+    for (let i=0;i<adaptiveMap.length;i++) total+=adaptiveMap[i]*3;
+    return total;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// EMBED
+// FIX: use typed arrays throughout; avoid repeated string concat
+// ─────────────────────────────────────────────────────────────────
+async function doEmbed(pixels, width, height, cipherText, password) {
+    const numPixels = width*height;
+    const adaptiveMap = computeAdaptiveMap(pixels, width, height);
+    const hash = await sha256Hex(password);
+    const pixelOrder = generatePixelOrder(numPixels, hash);
+
+    // Build byte array for message (UTF-8 safe via TextEncoder)
+    const msgWithDelim = cipherText + DELIMITER;
+    // Convert to binary bit array using Uint8Array for performance
+    const encoder = new TextEncoder();
+    const msgBytes = encoder.encode(msgWithDelim);
+    // Total bits = msgBytes.length * 8
+    const totalMsgBits = msgBytes.length * 8;
+
+    const capacity = computeAdaptiveCapacity(adaptiveMap);
+    if (totalMsgBits > capacity) {
+        throw new Error(
+            `Message too large. Adaptive capacity: ${capacity.toLocaleString()} bits. ` +
+            `Message needs: ${totalMsgBits.toLocaleString()} bits.`
+        );
+    }
+
+    // Build a flat bit buffer (Uint8Array of 0/1 values) — avoids giant string
+    const bitBuf = new Uint8Array(totalMsgBits);
+    for (let b=0;b<msgBytes.length;b++) {
+        const byte = msgBytes[b];
+        const base = b*8;
+        for (let bit=7;bit>=0;bit--) {
+            bitBuf[base+(7-bit)] = (byte>>bit)&1;
+        }
+    }
+
+    const stegoData = new Uint8ClampedArray(pixels);
+    let bitIdx = 0;
+
+    for (let pi=0; pi<numPixels && bitIdx<totalMsgBits; pi++) {
+        const pixelIdx = pixelOrder[pi];
+        const N = adaptiveMap[pixelIdx];
+        const mask = (1<<N)-1;
+        const clearMask = (~mask)&0xFF;
+
+        for (let ch=0; ch<3 && bitIdx<totalMsgBits; ch++) {
+            const byteIdx = pixelIdx*4+ch;
+            const bitsAvail = Math.min(N, totalMsgBits-bitIdx);
+            // Pack bitsAvail bits into value
+            let value = 0;
+            for (let k=0;k<bitsAvail;k++) {
+                value = (value<<1) | bitBuf[bitIdx+k];
+            }
+            // If fewer bits than N, pad right with zeros (already zero from above)
+            if (bitsAvail < N) value = value<<(N-bitsAvail);
+            stegoData[byteIdx] = (stegoData[byteIdx]&clearMask)|value;
+            bitIdx += N; // always advance by N (over-advance is harmless, loop exits)
+        }
+    }
+
+    // Texture map
+    const mapData = new Uint8ClampedArray(numPixels*4);
+    const usedPixels = new Uint8Array(numPixels); // bitset
+    let tmpIdx=0;
+    for (let pi=0;pi<numPixels;pi++) {
+        if (tmpIdx>=totalMsgBits) break;
+        usedPixels[pixelOrder[pi]]=1;
+        tmpIdx+=adaptiveMap[pixelOrder[pi]]*3;
+    }
+    for (let i=0;i<numPixels;i++) {
+        const base=i*4;
+        if (usedPixels[i]) {
+            const n=adaptiveMap[i];
+            mapData[base]  =n===3?220:n===2?30:30;
+            mapData[base+1]=n===3?40:n===2?180:100;
+            mapData[base+2]=n===3?40:n===2?60:220;
+            mapData[base+3]=255;
+        } else {
+            mapData[base]=10; mapData[base+1]=15; mapData[base+2]=25; mapData[base+3]=255;
+        }
+    }
+
+    let n1=0,n2=0,n3=0;
+    for (let i=0;i<numPixels;i++) {
+        const n=adaptiveMap[i];
+        if(n===1)n1++;else if(n===2)n2++;else n3++;
+    }
+
+    return {
+        stegoData: stegoData.buffer,
+        mapData: mapData.buffer,
+        width, height,
+        finalBits: bitIdx,
+        adaptiveStats: { smooth:n1, edge:n2, textured:n3, total:numPixels, capacity }
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// EXTRACT
+// FIX: use typed Uint8Array bit buffer; byte-level delimiter scan
+//      never builds a huge string; bails out fast with wrong key
+// ─────────────────────────────────────────────────────────────────
+
+// Pre-encode delimiter as bytes for fast comparison
+const DELIM_BYTES = (function(){
+    const enc = new TextEncoder();
+    return enc.encode(DELIMITER); // Uint8Array
+})();
+const DELIM_LEN = DELIM_BYTES.length; // in bytes
+
+async function doExtract(pixels, width, height, password) {
+    const numPixels = width*height;
+    const adaptiveMap = computeAdaptiveMap(pixels, width, height);
+    const hash = await sha256Hex(password);
+    const pixelOrder = generatePixelOrder(numPixels, hash);
+
+    // We accumulate extracted *bytes* (not bits) via a rolling buffer.
+    // This avoids building a giant string and makes delimiter detection O(1).
+    const MAX_BYTES = 1_000_000; // 1 MB safety cap
+    const extracted = new Uint8Array(MAX_BYTES + DELIM_LEN + 10);
+    let byteCount = 0;
+    let bitAccum = 0;   // accumulator for current partial byte
+    let bitsInAccum = 0; // how many bits are in bitAccum
+
+    for (let pi=0; pi<numPixels; pi++) {
+        const pixelIdx = pixelOrder[pi];
+        const N = adaptiveMap[pixelIdx];
+        const mask = (1<<N)-1;
+
+        for (let ch=0; ch<3; ch++) {
+            const byteIdx = pixelIdx*4+ch;
+            // Extract N bits from this channel
+            const bits = data_arr[byteIdx]&mask;
+
+            // Feed bits (MSB-first within the N-bit group) into accumulator
+            for (let b=N-1; b>=0; b--) {
+                bitAccum = (bitAccum<<1)|((bits>>b)&1);
+                bitsInAccum++;
+                if (bitsInAccum===8) {
+                    if (byteCount >= MAX_BYTES) {
+                        throw new Error(
+                            'Extraction failed: delimiter not found within limit. ' +
+                            'Ensure the password matches the one used during embedding.'
+                        );
+                    }
+                    extracted[byteCount++] = bitAccum&0xFF;
+                    bitAccum = 0; bitsInAccum = 0;
+
+                    // Check delimiter at tail — only when we have enough bytes
+                    if (byteCount >= DELIM_LEN) {
+                        let match = true;
+                        for (let d=0; d<DELIM_LEN; d++) {
+                            if (extracted[byteCount-DELIM_LEN+d] !== DELIM_BYTES[d]) {
+                                match=false; break;
+                            }
+                        }
+                        if (match) {
+                            // Strip delimiter; decode UTF-8
+                            const msgBytes = extracted.subarray(0, byteCount-DELIM_LEN);
+                            const decoder = new TextDecoder();
+                            const cipherText = decoder.decode(msgBytes);
+                            return { cipherText };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    throw new Error(
+        'Extraction failed: delimiter not found. ' +
+        'Ensure the password matches the one used during embedding.'
+    );
+}
+
+// ── Message handler ───────────────────────────────────────────────
+// We receive pixel data as a transferred ArrayBuffer (zero-copy)
+let data_arr = null;
+
+self.onmessage = async (e) => {
+    const { type, id } = e.data;
+    try {
+        if (type === 'EMBED') {
+            const { pixelsBuf, width, height, cipherText, password } = e.data;
+            data_arr = new Uint8ClampedArray(pixelsBuf);
+            const result = await doEmbed(data_arr, width, height, cipherText, password);
+            self.postMessage({ id, type:'EMBED_OK', ...result },
+                [result.stegoData, result.mapData]);
+        } else if (type === 'EXTRACT') {
+            const { pixelsBuf, width, height, password } = e.data;
+            data_arr = new Uint8ClampedArray(pixelsBuf);
+            const result = await doExtract(data_arr, width, height, password);
+            self.postMessage({ id, type:'EXTRACT_OK', ...result });
+        } else if (type === 'ANALYZE') {
+            const { pixelsBuf, width, height } = e.data;
+            const pixels = new Uint8ClampedArray(pixelsBuf);
+            const map = computeAdaptiveMap(pixels, width, height);
+            let n1=0,n2=0,n3=0;
+            for(let i=0;i<map.length;i++){const n=map[i];if(n===1)n1++;else if(n===2)n2++;else n3++;}
+            const capacity = computeAdaptiveCapacity(map);
+            self.postMessage({ id, type:'ANALYZE_OK', smooth:n1, edge:n2, textured:n3,
+                total:map.length, capacity });
+        }
+    } catch(err) {
+        self.postMessage({ id, type:'ERROR', message: err.message });
+    }
+};
+</script>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 1 — IMAGE UTILITIES
+// ─────────────────────────────────────────────────────────────────────────────
+
+const fileToImageData = (file) => new Promise((resolve, reject) => {
+    if (!file || !file.type.match('image.*')) { reject(new Error("Not a valid image.")); return; }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width; canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+            try { resolve(ctx.getImageData(0, 0, img.width, img.height)); }
+            catch (err) { reject(new Error("Cannot read image data — use a locally hosted image.")); }
+        };
+        img.onerror = () => reject(new Error("Image loading failed."));
+        img.src = e.target.result;
+    };
+    reader.onerror = () => reject(new Error("File reading failed."));
+    reader.readAsDataURL(file);
+});
+
+const imageDataToPNG = (imageData) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = imageData.width; canvas.height = imageData.height;
+    canvas.getContext('2d').putImageData(imageData, 0, 0);
+    return new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+};
+
+const mapDataToPNGUrl = (mapBuffer, width, height) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = width; canvas.height = height;
+    canvas.getContext('2d').putImageData(
+        new ImageData(new Uint8ClampedArray(mapBuffer), width, height), 0, 0
+    );
+    return canvas.toDataURL('image/png');
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 2 — AES-256 ENCRYPTION / DECRYPTION (main thread only)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const encryptMessage = (message, password) =>
+    CryptoJS.AES.encrypt(message, password).toString();
+
+const decryptMessage = (cipherText, password) => {
+    try {
+        const bytes = CryptoJS.AES.decrypt(cipherText, password);
+        const text = bytes.toString(CryptoJS.enc.Utf8);
+        if (!text && cipherText.length > 0) throw new Error("Invalid password or corrupted data.");
+        return text;
+    } catch (e) {
+        throw new Error("Decryption failed: wrong password or corrupted data.");
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 3 — WEB WORKER MANAGER
+// Spawns a single persistent worker from the inline script blob.
+// All embed/extract/analyze calls go through it to keep the UI responsive.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let _worker = null;
+let _workerCallbacks = {};
+let _msgId = 0;
+
+function getWorker() {
+    if (_worker) return _worker;
+    const src = document.getElementById('worker-src').textContent;
+    const blob = new Blob([src], { type: 'application/javascript' });
+    _worker = new Worker(URL.createObjectURL(blob));
+    _worker.onmessage = (e) => {
+        const { id } = e.data;
+        const cb = _workerCallbacks[id];
+        if (cb) { delete _workerCallbacks[id]; cb(e.data); }
+    };
+    _worker.onerror = (e) => {
+        console.error('Worker error:', e);
+    };
+    return _worker;
+}
+
+function workerCall(msg, transfers=[]) {
+    return new Promise((resolve, reject) => {
+        const id = ++_msgId;
+        _workerCallbacks[id] = (result) => {
+            if (result.type === 'ERROR') reject(new Error(result.message));
+            else resolve(result);
+        };
+        getWorker().postMessage({ ...msg, id }, transfers);
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 4 — PUBLIC API (wraps worker calls)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const T1 = 30, T2 = 80;
+
+async function analyzeImage(imageData) {
+    const buf = imageData.data.buffer.slice(0);
+    return workerCall({ type:'ANALYZE', pixelsBuf:buf,
+        width:imageData.width, height:imageData.height }, [buf]);
+}
+
+async function embedData(imageData, cipherText, password) {
+    const buf = imageData.data.buffer.slice(0);
+    return workerCall({ type:'EMBED', pixelsBuf:buf,
+        width:imageData.width, height:imageData.height,
+        cipherText, password }, [buf]);
+}
+
+async function extractData(imageData, password) {
+    const buf = imageData.data.buffer.slice(0);
+    return workerCall({ type:'EXTRACT', pixelsBuf:buf,
+        width:imageData.width, height:imageData.height,
+        password }, [buf]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 5 — UI COMPONENTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PanelCard = ({ title, children }) => (
+    <div className="bg-card p-6 sm:p-8 rounded-2xl shadow-2xl border border-border-color h-full flex flex-col">
+        <h2 className="text-xl font-bold mb-6 text-text-light border-b border-border-color pb-3">{title}</h2>
+        {children}
+    </div>
+);
+
+const FileInput = ({ label, onChange, accept, fileUrl, clearFile }) => (
+    <div className="space-y-4">
+        <label className="block text-sm font-medium text-text-muted">{label}</label>
+        <div className="flex items-center space-x-4">
+            <input type="file" accept={accept} onChange={onChange}
+                className="block w-full text-sm text-text-light file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-secondary-card file:text-primary hover:file:bg-border-color transition duration-150" />
+            {fileUrl && (
+                <button onClick={clearFile} className="text-error-color hover:text-red-400 p-2 rounded-full transition">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                        <path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5 0a1 1 0 10-2 0v6a1 1 0 102 0V8z" clipRule="evenodd" />
+                    </svg>
+                </button>
+            )}
+        </div>
+        {fileUrl && (
+            <div className="max-w-xs h-auto max-h-48 mx-auto p-2 bg-secondary-card rounded-lg border border-border-color">
+                <img src={fileUrl} alt="Preview" className="w-full h-full object-contain rounded-md" />
+            </div>
+        )}
+    </div>
+);
+
+const PasswordInput = ({ value, onChange, showPassword, toggleVisibility, label = "Password" }) => (
+    <div>
+        <label className="block text-sm font-medium text-text-muted mb-1">{label}</label>
+        <div className="relative">
+            <input type={showPassword ? 'text' : 'password'} value={value} onChange={onChange}
+                placeholder="Secret key"
+                className="w-full p-3 pr-10 bg-secondary-card border border-border-color rounded-lg text-text-light placeholder-gray-500 focus:ring-primary focus:border-primary transition" />
+            <button type="button" onClick={toggleVisibility}
+                className="absolute inset-y-0 right-0 pr-3 flex items-center text-text-muted hover:text-primary transition">
+                {showPassword
+                    ? <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M10 12a2 2 0 100-4 2 2 0 000 4z" /><path fillRule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clipRule="evenodd" /></svg>
+                    : <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M3.707 2.293a1 1 0 00-1.414 1.414l14 14a1 1 0 001.414-1.414l-1.473-1.473A10.014 10.014 0 0019.542 10c-1.274-4.057-5.064-7-9.542-7a9.986 9.986 0 00-1.07 0l-2.828-2.828zM9.54 12.454l.463-.463a2 2 0 00-2.433-2.433l-.463.463a4 4 0 016.416 3.194z" clipRule="evenodd" /><path d="M10 12a2 2 0 100-4 2 2 0 000 4z" /></svg>
+                }
+            </button>
+        </div>
+    </div>
+);
+
+const AdaptiveStatsBar = ({ stats }) => {
+    if (!stats) return null;
+    const { smooth, edge, textured, total, capacity } = stats;
+    const p1 = (smooth / total * 100).toFixed(1);
+    const p2 = (edge / total * 100).toFixed(1);
+    const p3 = (textured / total * 100).toFixed(1);
+    return (
+        <div className="mt-4 p-4 bg-secondary-card rounded-xl border border-border-color text-xs space-y-3">
+            <p className="text-text-light font-semibold text-sm">Adaptive Region Analysis — N(x,y)</p>
+            <div className="flex rounded-full overflow-hidden h-4" title="Adaptive region breakdown">
+                <div style={{ width: p1 + '%', background: '#1e64dc' }} title={`N=1 smooth: ${p1}%`}></div>
+                <div style={{ width: p2 + '%', background: '#1eb47a' }} title={`N=2 edge: ${p2}%`}></div>
+                <div style={{ width: p3 + '%', background: '#dc3b3b' }} title={`N=3 textured: ${p3}%`}></div>
+            </div>
+            <div className="flex gap-4 flex-wrap">
+                <span><span className="legend-dot" style={{ background: '#1e64dc' }}></span>N=1 smooth: {p1}% ({smooth.toLocaleString()} px)</span>
+                <span><span className="legend-dot" style={{ background: '#1eb47a' }}></span>N=2 edge: {p2}% ({edge.toLocaleString()} px)</span>
+                <span><span className="legend-dot" style={{ background: '#dc3b3b' }}></span>N=3 textured: {p3}% ({textured.toLocaleString()} px)</span>
+            </div>
+            <p className="text-text-muted">Total adaptive capacity: <span className="text-text-light font-semibold">{capacity.toLocaleString()} bits</span> ({(capacity / 8 / 1024).toFixed(1)} KB)</p>
+            <p className="text-text-muted text-xs italic">Pixel traversal order randomised via SHA-256-seeded LCG permutation.</p>
+        </div>
+    );
+};
+
+const EmbeddingPanel = ({
+    coverImageUrl, coverImage, message, password,
+    isLoading, handleFileChange, handleMessageChange,
+    handlePasswordChange, handleEmbedding, showPassword,
+    togglePasswordVisibility, adaptiveCapacity,
+    stegoImageUrl, textureMapUrl, adaptiveStats, previewStats,
+}) => {
+    const DELIMITER_OVERHEAD = 7 * 8; // "$$END$$" in bits (raw; cipher adds more)
+    const msgBits = message.length * 8 + DELIMITER_OVERHEAD;
+    const ratio = adaptiveCapacity > 0 ? msgBits / adaptiveCapacity : 0;
+    const isButtonDisabled = !coverImage || !message || !password || isLoading;
+
+    return (
+        <PanelCard title="1. Embed Data">
+            <div className="space-y-6 flex-grow">
+                <FileInput label="Cover Image (.png recommended)" onChange={handleFileChange}
+                    accept="image/png,image/jpeg" fileUrl={coverImageUrl}
+                    clearFile={() => handleFileChange({ target: { files: [] } })} />
+
+                {previewStats && <AdaptiveStatsBar stats={previewStats} />}
+
+                <div>
+                    <label className="block text-sm font-medium text-text-muted mb-1">Secret Message</label>
+                    <textarea value={message} onChange={handleMessageChange} rows="4"
+                        placeholder="Enter the secret message to hide..."
+                        className="w-full p-3 bg-secondary-card border border-border-color rounded-lg text-text-light placeholder-gray-500 focus:ring-primary focus:border-primary transition resize-none" />
+                    <p className="text-xs text-text-muted mt-1">
+                        Message: {message.length} chars (~{msgBits.toLocaleString()} bits raw).
+                        Adaptive capacity: {adaptiveCapacity.toLocaleString()} bits.
+                        {adaptiveCapacity > 0 && (
+                            <span className={ratio > 0.95 ? " text-error-color font-semibold" : " text-success-color"}>
+                                {" "}({(ratio * 100).toFixed(1)}% estimated)
+                            </span>
+                        )}
+                    </p>
+                    {ratio > 0.90 && adaptiveCapacity > 0 &&
+                        <p className="text-sm text-error-color mt-1 font-semibold">Warning: message may approach capacity after AES encryption overhead.</p>}
+                </div>
+
+                <PasswordInput value={password} onChange={handlePasswordChange}
+                    showPassword={showPassword} toggleVisibility={togglePasswordVisibility}
+                    label="Encryption Password (seeds pixel traversal order)" />
+
+                <div className="bg-secondary-card rounded-lg p-3 border border-border-color text-xs text-text-muted space-y-1">
+                    <p className="font-semibold text-text-light">How true adaptive embedding works:</p>
+                    <p>• Sobel edge detection + local variance → classifies every pixel into N(x,y) ∈ {"{1, 2, 3}"}</p>
+                    <p>• Smooth regions (N=1): 1-bit LSB — minimal distortion</p>
+                    <p>• Edge regions (N=2): 2-bit LSB — moderate capacity</p>
+                    <p>• Textured regions (N=3): 3-bit LSB — maximum capacity, visually masked</p>
+                    <p>• Pixel traversal order randomised by password → defeats chi-square & RS steganalysis</p>
+                    <p>• All heavy processing runs in a background worker — UI stays responsive</p>
+                </div>
+            </div>
+
+            <button onClick={handleEmbedding} disabled={isButtonDisabled}
+                className={`w-full py-3 px-4 rounded-lg font-semibold transition mt-6 ${
+                    isButtonDisabled
+                        ? 'bg-secondary-card text-text-muted cursor-not-allowed'
+                        : 'bg-primary text-background hover:bg-primary-dark shadow-lg shadow-primary/30'
+                }`}>
+                {isLoading ? 'Analysing & Embedding…' : 'Encrypt & Embed (Adaptive)'}
+            </button>
+
+            {textureMapUrl && stegoImageUrl && (
+                <div className="mt-8 pt-6 border-t border-border-color">
+                    <h3 className="text-sm font-semibold text-text-light mb-1">Adaptive Texture Map</h3>
+                    <div className="flex gap-3 text-xs text-text-muted mb-3 flex-wrap">
+                        <span><span className="legend-dot" style={{ background: '#1e64dc' }}></span>N=1 smooth (1-bit)</span>
+                        <span><span className="legend-dot" style={{ background: '#1eb47a' }}></span>N=2 edge (2-bit)</span>
+                        <span><span className="legend-dot" style={{ background: '#dc3b3b' }}></span>N=3 textured (3-bit)</span>
+                        <span><span className="legend-dot" style={{ background: '#0a0f19' }}></span>Unmodified</span>
+                    </div>
+                    <AdaptiveStatsBar stats={adaptiveStats} />
+                    <div className="w-full max-w-xs mx-auto mt-4 p-3 bg-secondary-card rounded-xl border border-border-color">
+                        <img src={textureMapUrl} alt="Adaptive texture map"
+                            className="w-full h-auto rounded-lg object-contain" style={{ imageRendering: 'pixelated' }} />
+                    </div>
+                    <div className="flex justify-center mt-5">
+                        <a href={stegoImageUrl} download="stego_adaptive.png"
+                            className="inline-flex items-center px-4 py-2 text-sm font-medium rounded-lg text-background bg-success-color hover:bg-green-600 transition">
+                            <svg className="-ml-1 mr-2 h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                            </svg>
+                            Download Stego Image (.png)
+                        </a>
+                    </div>
+                </div>
+            )}
+        </PanelCard>
+    );
+};
+
+const ExtractionPanel = ({
+    stegoImageUrl, extractionPassword, isLoading,
+    handleFileChange, handlePasswordChange, handleExtraction,
+    showPassword, togglePasswordVisibility,
+}) => {
+    const isButtonDisabled = !stegoImageUrl || !extractionPassword || isLoading;
+    return (
+        <PanelCard title="2. Extract Data">
+            <div className="space-y-6 flex-grow">
+                <FileInput label="Stego Image (must be the downloaded .png)"
+                    onChange={handleFileChange} accept="image/png"
+                    fileUrl={stegoImageUrl}
+                    clearFile={() => handleFileChange({ target: { files: [] } })} />
+                <PasswordInput value={extractionPassword} onChange={handlePasswordChange}
+                    showPassword={showPassword} toggleVisibility={togglePasswordVisibility}
+                    label="Decryption Password (must match embedding password)" />
+                <div className="bg-secondary-card rounded-lg p-3 border border-border-color text-xs text-text-muted">
+                    <p>No LSB factor needed — the adaptive map and pixel order are both re-derived from the stego image and password automatically.</p>
+                    <p className="mt-1">A wrong password will produce a decryption error immediately — it will not hang.</p>
+                </div>
+            </div>
+            <button onClick={handleExtraction} disabled={isButtonDisabled}
+                className={`w-full py-3 px-4 rounded-lg font-semibold transition mt-6 ${
+                    isButtonDisabled
+                        ? 'bg-secondary-card text-text-muted cursor-not-allowed'
+                        : 'bg-primary text-background hover:bg-primary-dark shadow-lg shadow-primary/30'
+                }`}>
+                {isLoading ? 'Extracting…' : 'Extract & Decrypt Data'}
+            </button>
+        </PanelCard>
+    );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 6 — APP STATE
+// ─────────────────────────────────────────────────────────────────────────────
+
+const App = () => {
+    const [activeTab, setActiveTab] = useState('embed');
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState(null);
+    const [success, setSuccess] = useState(null);
+    const [showPassword, setShowPassword] = useState(false);
+
+    // Embed state
+    const [coverImage, setCoverImage] = useState(null);
+    const [coverImageUrl, setCoverImageUrl] = useState(null);
+    const [coverImageData, setCoverImageData] = useState(null);
+    const [message, setMessage] = useState('');
+    const [embeddingPassword, setEmbeddingPassword] = useState('');
+    const [stegoImageUrl, setStegoImageUrl] = useState(null);
+    const [textureMapUrl, setTextureMapUrl] = useState(null);
+    const [finalSizeInBits, setFinalSizeInBits] = useState(0);
+    const [adaptiveStats, setAdaptiveStats] = useState(null);
+    const [previewStats, setPreviewStats] = useState(null);
+    const [adaptiveCapacity, setAdaptiveCapacity] = useState(0);
+
+    // Extract state
+    const [stegoImage, setStegoImage] = useState(null);
+    const [stegoImageUrlExtract, setStegoImageUrlExtract] = useState(null);
+    const [extractionPassword, setExtractionPassword] = useState('');
+    const [extractedMessage, setExtractedMessage] = useState(null);
+
+    const resetEmbedResults = () => {
+        setStegoImageUrl(null); setTextureMapUrl(null);
+        setFinalSizeInBits(0); setAdaptiveStats(null);
+    };
+
+    // Cover image file handler — runs analysis in worker
+    const handleFileChange = useCallback(async (event) => {
+        setError(null); setSuccess(null); resetEmbedResults(); setPreviewStats(null); setAdaptiveCapacity(0);
+        const files = event.target.files;
+        if (!files || files.length === 0) {
+            setCoverImage(null); setCoverImageUrl(null); setCoverImageData(null); return;
+        }
+        const file = files[0];
+        setCoverImage(file);
+        setCoverImageUrl(URL.createObjectURL(file));
+        try {
+            const imageData = await fileToImageData(file);
+            setCoverImageData(imageData);
+            // Offload analysis to worker
+            const stats = await analyzeImage(imageData);
+            setPreviewStats(stats);
+            setAdaptiveCapacity(stats.capacity);
+        } catch (err) {
+            setError(`Image load error: ${err.message}`);
+            setCoverImage(null); setCoverImageUrl(null); setCoverImageData(null);
+        }
+    }, []);
+
+    const handleExtractionFileChange = useCallback(async (event) => {
+        setError(null); setSuccess(null); setExtractedMessage(null);
+        const files = event.target.files;
+        if (!files || files.length === 0) { setStegoImage(null); setStegoImageUrlExtract(null); return; }
+        const file = files[0];
+        setStegoImage(file);
+        setStegoImageUrlExtract(URL.createObjectURL(file));
+    }, []);
+
+    const handleEmbedding = async () => {
+        if (!coverImage || !message || !embeddingPassword || !coverImageData) {
+            setError('Please provide a cover image, message, and password.'); return;
+        }
+        setIsLoading(true); setError(null); setSuccess(null); resetEmbedResults();
+        try {
+            // AES encrypt on main thread (fast), then send to worker for embedding
+            const cipherText = encryptMessage(message, embeddingPassword);
+            const result = await embedData(coverImageData, cipherText, embeddingPassword);
+            // Reconstruct ImageData from transferred buffer
+            const stegoImageData = new ImageData(
+                new Uint8ClampedArray(result.stegoData), result.width, result.height
+            );
+            const blob = await imageDataToPNG(stegoImageData);
+            setStegoImageUrl(URL.createObjectURL(blob));
+            setTextureMapUrl(mapDataToPNGUrl(result.mapData, result.width, result.height));
+            setFinalSizeInBits(result.finalBits);
+            setAdaptiveStats(result.adaptiveStats);
+            setSuccess(`Data embedded. ${result.finalBits.toLocaleString()} bits written using adaptive N(x,y) mapping + pseudo-random traversal.`);
+        } catch (err) {
+            setError(err.message || 'Embedding failed.');
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handleExtraction = async () => {
+        if (!stegoImage || !extractionPassword) {
+            setError('Please provide a stego image and password.'); return;
+        }
+        setIsLoading(true); setError(null); setSuccess(null); setExtractedMessage(null);
+        try {
+            const stegoImageData = await fileToImageData(stegoImage);
+            // Extract binary payload in worker (non-blocking)
+            const { cipherText } = await extractData(stegoImageData, extractionPassword);
+            // Decrypt on main thread
+            const original = decryptMessage(cipherText, extractionPassword);
+            setExtractedMessage(original);
+            setSuccess('Data extracted and decrypted successfully.');
+        } catch (err) {
+            setError(err.message || 'Extraction failed.');
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const NavTabs = (
+        <div className="flex justify-center mb-8">
+            {['embed', 'extract'].map((tab, i) => (
+                <button key={tab}
+                    className={`px-6 py-3 font-semibold transition ${i === 0 ? 'rounded-l-lg' : 'rounded-r-lg'} ${
+                        activeTab === tab
+                            ? 'bg-primary text-background shadow-lg'
+                            : 'bg-secondary-card text-text-light hover:bg-border-color'
+                    }`}
+                    onClick={() => { setActiveTab(tab); setError(null); setSuccess(null); }}>
+                    {tab === 'embed' ? 'Embed Data' : 'Extract Data'}
+                </button>
+            ))}
+        </div>
+    );
+
+    const ResultsPanel = (
+        <PanelCard title="Results">
+            {error && (
+                <div className="bg-error-color/10 border-l-4 border-error-color text-error-color p-4 rounded-lg mb-4">
+                    <p className="font-semibold">Error</p>
+                    <p className="text-sm">{error}</p>
+                </div>
+            )}
+            {success && (
+                <div className="bg-success-color/10 border-l-4 border-success-color text-success-color p-4 rounded-lg mb-4">
+                    <p className="font-semibold">Success</p>
+                    <p className="text-sm">{success}</p>
+                </div>
+            )}
+            {activeTab === 'embed' && finalSizeInBits > 0 && (
+                <div className="space-y-3 text-sm">
+                    <p className="text-text-light"><span className="font-semibold text-primary">Embedded:</span> {finalSizeInBits.toLocaleString()} bits</p>
+                    {adaptiveStats && (
+                        <>
+                            <p className="text-text-muted">Smooth pixels used (N=1): {adaptiveStats.smooth.toLocaleString()}</p>
+                            <p className="text-text-muted">Edge pixels used (N=2): {adaptiveStats.edge.toLocaleString()}</p>
+                            <p className="text-text-muted">Textured pixels used (N=3): {adaptiveStats.textured.toLocaleString()}</p>
+                            <p className="text-text-muted text-xs italic mt-2">
+                                Embedding thresholds: T₁={T1}, T₂={T2}. Pixel order derived from SHA-256(password) via Fisher-Yates LCG shuffle.
+                            </p>
+                        </>
+                    )}
+                </div>
+            )}
+            {activeTab === 'extract' && extractedMessage !== null && (
+                <div className="space-y-3">
+                    <h3 className="text-lg font-semibold text-success-color">Decrypted Message:</h3>
+                    <div className="bg-secondary-card p-4 rounded-lg border border-border-color">
+                        <p className="whitespace-pre-wrap text-text-light break-words">{extractedMessage}</p>
+                    </div>
+                </div>
+            )}
+            {isLoading && (
+                <div className="flex items-center gap-3 text-text-muted text-sm mt-2">
+                    <svg className="animate-spin h-5 w-5 text-primary" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                    </svg>
+                    Processing in background worker… UI remains responsive.
+                </div>
+            )}
+            {!error && !success && !isLoading && finalSizeInBits === 0 && extractedMessage === null && (
+                <p className="text-text-muted italic">Results will appear here after embedding or extraction.</p>
+            )}
+        </PanelCard>
+    );
+
+    return (
+        <div className="max-w-6xl mx-auto py-8">
+            <header className="text-center mb-10">
+                <h1 className="text-4xl font-extrabold text-primary mb-2">
+                    Adaptive LSB Steganography
+                </h1>
+                <p className="text-text-muted">
+                    content-aware adaptive embedding with pseudo-random pixel traversal & AES-256 encryption
+                </p>
+                <div className="flex justify-center gap-3 mt-3 flex-wrap">
+                    <span className="text-xs bg-secondary-card px-3 py-1 rounded-full text-primary border border-border-color">Sobel Edge Detection</span>
+                    <span className="text-xs bg-secondary-card px-3 py-1 rounded-full text-primary border border-border-color">Local Variance Analysis</span>
+                    <span className="text-xs bg-secondary-card px-3 py-1 rounded-full text-primary border border-border-color">N(x,y) Decision Function</span>
+                    <span className="text-xs bg-secondary-card px-3 py-1 rounded-full text-primary border border-border-color">Pseudo-Random Traversal</span>
+                    <span className="text-xs bg-secondary-card px-3 py-1 rounded-full text-primary border border-border-color">AES-256 Encryption</span>
+                    <span className="text-xs bg-secondary-card px-3 py-1 rounded-full text-success-color border border-border-color">Non-blocking Worker</span>
+                </div>
+            </header>
+
+            {NavTabs}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <div>
+                    {activeTab === 'embed' ? (
+                        <EmbeddingPanel
+                            coverImageUrl={coverImageUrl}
+                            coverImage={coverImage}
+                            message={message}
+                            password={embeddingPassword}
+                            isLoading={isLoading}
+                            handleFileChange={handleFileChange}
+                            handleMessageChange={e => { setMessage(e.target.value); resetEmbedResults(); }}
+                            handlePasswordChange={e => { setEmbeddingPassword(e.target.value); resetEmbedResults(); }}
+                            handleEmbedding={handleEmbedding}
+                            showPassword={showPassword}
+                            togglePasswordVisibility={() => setShowPassword(s => !s)}
+                            adaptiveCapacity={adaptiveCapacity}
+                            stegoImageUrl={stegoImageUrl}
+                            textureMapUrl={textureMapUrl}
+                            adaptiveStats={adaptiveStats}
+                            previewStats={previewStats}
+                        />
+                    ) : (
+                        <ExtractionPanel
+                            stegoImageUrl={stegoImageUrlExtract}
+                            extractionPassword={extractionPassword}
+                            isLoading={isLoading}
+                            handleFileChange={handleExtractionFileChange}
+                            handlePasswordChange={e => setExtractionPassword(e.target.value)}
+                            handleExtraction={handleExtraction}
+                            showPassword={showPassword}
+                            togglePasswordVisibility={() => setShowPassword(s => !s)}
+                        />
+                    )}
+                </div>
+                {ResultsPanel}
+                <footer className="md:col-span-2 mt-6 text-center text-xs text-text-muted space-y-1">
+                    <p>Only PNG images are guaranteed lossless. JPEG compression corrupts LSB data.</p>
+                    <p>Mathematical basis: N(x,y) = 1 if V(x,y) &lt; T₁ | 2 if T₁ ≤ V(x,y) &lt; T₂ | 3 if V(x,y) ≥ T₂, where V(x,y) = max(Sobel magnitude, local variance), T₁={T1}, T₂={T2}.</p>
+                </footer>
+            </div>
+        </div>
+    );
+};
+
+const container = document.getElementById('root');
+if (container) ReactDOM.createRoot(container).render(<App />);
+</script>
+</body>
+</html>
